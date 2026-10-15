@@ -241,6 +241,119 @@ acquire_prune_lock() {
 release_prune_lock() {
   exec 199>&-
 }
+# current_boot_id
+#
+# Linux gives every boot a unique identifier. Recording it prevents a PID from
+# a previous WSL instance from ever being accepted after PID reuse.
+current_boot_id() {
+  [[ -r /proc/sys/kernel/random/boot_id ]] || return 1
+  cat /proc/sys/kernel/random/boot_id
+}
+
+# process_start_ticks <pid>
+#
+# Field 22 of /proc/<pid>/stat is the process start time since boot. Combined
+# with boot_id it uniquely identifies the recorded process lifetime rather than
+# merely trusting a reusable numeric PID.
+process_start_ticks() {
+  local pid="$1"
+
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  [[ -r "/proc/$pid/stat" ]] || return 1
+
+  awk '{print $22}' "/proc/$pid/stat" 2>/dev/null
+}
+
+# unfsd_process_matches_config <pid> <volume> <dir> <port> [ro]
+#
+# Verify that PID is actually our configured unfsd process. This deliberately
+# does not rely on the process name alone: executable identity, complete daemon
+# arguments, and exports-file contents must all match this tracked share.
+unfsd_process_matches_config() {
+  local pid="$1"
+  local vol="$2"
+  local dir="$3"
+  local port="$4"
+  local ro="${5:-}"
+
+  local ef="$STATE_DIR/$vol.exports"
+  local opts
+  local expected_cmd
+  local expected_exe
+  local live_exe
+  local actual_args
+  local expected_args
+  local expected_export
+
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+
+  expected_cmd="$(command -v "$UNFSD_BIN" 2>/dev/null)" || return 1
+  expected_exe="$(readlink -f "$expected_cmd" 2>/dev/null)" || return 1
+  live_exe="$(readlink -f "/proc/$pid/exe" 2>/dev/null)" || return 1
+
+  [[ "$live_exe" == "$expected_exe" ]] || return 1
+  [[ -r "/proc/$pid/cmdline" ]] || return 1
+
+  actual_args="$(
+    tr '\0' '\n' <"/proc/$pid/cmdline" 2>/dev/null |
+      tail -n +2
+  )" || return 1
+
+  expected_args="$(
+    printf '%s\n' \
+      -s \
+      -p \
+      -t \
+      -d \
+      -l "$LOOPBACK" \
+      -n "$port" \
+      -m "$port" \
+      -e "$ef"
+  )"
+
+  [[ "$actual_args" == "$expected_args" ]] || return 1
+
+  if [[ "$ro" == ro ]]; then
+    opts="ro,insecure"
+  else
+    opts="rw,no_root_squash,insecure"
+  fi
+
+  expected_export="$dir $LOOPBACK($opts)"
+
+  [[ -r "$ef" ]] || return 1
+  [[ "$(cat "$ef" 2>/dev/null)" == "$expected_export" ]] || return 1
+}
+
+# unfsd_matches_saved_identity
+#   <pid> <volume> <dir> <port> <ro> <boot-id> <pid-start>
+#
+# Validate both the persisted process lifetime identity and its expected unfsd
+# configuration. A PID from another boot or a recycled PID cannot match.
+unfsd_matches_saved_identity() {
+  local pid="$1"
+  local vol="$2"
+  local dir="$3"
+  local port="$4"
+  local ro="${5:-}"
+  local saved_boot="$6"
+  local saved_start="$7"
+
+  local boot
+  local start
+
+  [[ -n "$saved_boot" && -n "$saved_start" ]] || return 1
+
+  boot="$(current_boot_id)" || return 1
+  [[ "$boot" == "$saved_boot" ]] || return 1
+
+  start="$(process_start_ticks "$pid")" || return 1
+  [[ "$start" == "$saved_start" ]] || return 1
+
+  unfsd_process_matches_config \
+    "$pid" "$vol" "$dir" "$port" "$ro"
+}
 # share_locked <hostdir> [ro] <volume>
 #
 # Caller must hold the per-volume lifecycle lock.
@@ -359,7 +472,7 @@ stop_share_locked() {
   local vol="$1"
   local statef="$SHARES_DIR/$vol.env"
 
-  local DIR="" VOLUME="" PORT="" PID="" RO=""
+  local DIR="" VOLUME="" PORT="" PID="" RO="" BOOT_ID="" PID_START=""
 
   [[ -f "$statef" ]] || {
     warn "no such share: $vol"
@@ -395,9 +508,14 @@ stop_share_locked() {
     || session_run docker volume rm "$vol" >/dev/null 2>&1 \
     || warn "could not remove volume '$vol' (a container may still use it)"
 
-  if [[ -n "$PID" ]] && kill -0 "$PID" 2>/dev/null; then
-    log "stopping NFS server (pid $PID)"
-    kill "$PID" 2>/dev/null || true
+  if [[ -n "$PID" ]]; then
+    if unfsd_matches_saved_identity \
+        "$PID" "$vol" "$DIR" "$PORT" "$RO" "$BOOT_ID" "$PID_START"; then
+      log "stopping NFS server (pid $PID)"
+      kill "$PID" 2>/dev/null || true
+    elif kill -0 "$PID" 2>/dev/null; then
+      warn "not stopping pid $PID for '$vol': saved NFS server identity does not match the live process"
+    fi
   fi
 
   rm -f \
@@ -449,13 +567,43 @@ stop_share() {
 # process sourcing the state file can only observe the old complete record or
 # the new complete record, never a partially-written one.
 write_share_state_atomic() {
-  local statef="$1" dir="$2" vol="$3" port="$4" pid="$5" ro="${6:-}"
+  local statef="$1"
+  local dir="$2"
+  local vol="$3"
+  local port="$4"
+  local pid="$5"
+  local ro="${6:-}"
+
   local tmp_statef
+  local boot_id
+  local pid_start
+
+  # Never persist a server identity unless the process itself matches the exact
+  # unfsd configuration and its configured endpoint is actually reachable.
+  if ! unfsd_process_matches_config \
+      "$pid" "$vol" "$dir" "$port" "$ro"; then
+    return 1
+  fi
+
+  if ! port_is_up "$port"; then
+    return 1
+  fi
+
+  boot_id="$(current_boot_id)" || return 1
+  pid_start="$(process_start_ticks "$pid")" || return 1
 
   tmp_statef="$(mktemp "${statef}.XXXXXX")" || return 1
 
-  if ! printf 'DIR=%s\nVOLUME=%s\nPORT=%s\nPID=%s\nRO=%s\n' \
-      "$dir" "$vol" "$port" "$pid" "$ro" >"$tmp_statef"; then
+  if ! printf \
+      'DIR=%s\nVOLUME=%s\nPORT=%s\nPID=%s\nRO=%s\nBOOT_ID=%s\nPID_START=%s\n' \
+      "$dir" \
+      "$vol" \
+      "$port" \
+      "$pid" \
+      "$ro" \
+      "$boot_id" \
+      "$pid_start" \
+      >"$tmp_statef"; then
     rm -f "$tmp_statef"
     return 1
   fi
@@ -465,7 +613,6 @@ write_share_state_atomic() {
     return 1
   fi
 }
-
 # restore_share_locked <volume>
 #
 # Caller must hold the per-volume restore lock.
@@ -474,8 +621,14 @@ restore_share_locked() {
   local statef="$SHARES_DIR/$vol.env"
 
   # Keep sourced state local to this invocation. This prevents stale shell
-  # values from hiding a malformed state file.
-  local DIR="" VOLUME="" PORT="" PID="" RO=""
+  # values from hiding malformed or incomplete state.
+  local DIR=""
+  local VOLUME=""
+  local PORT=""
+  local PID=""
+  local RO=""
+  local BOOT_ID=""
+  local PID_START=""
 
   [[ -f "$statef" ]] || return 0
 
@@ -494,16 +647,26 @@ restore_share_locked() {
 
   ensure_server
 
-  # If the original unfsd disappeared, restart the same export on the same
-  # endpoint. Existing NFS mounts can then recover without container recreation.
-  if ! {
-    [[ -n "$PID" ]] &&
-    kill -0 "$PID" 2>/dev/null &&
-    port_is_up "$PORT"
-  }; then
-
+  # Reuse a live server only when its persisted process lifetime and complete
+  # unfsd configuration match this share. PID existence and port reachability
+  # alone are deliberately insufficient because both can be independently
+  # reused after a restart.
+  if unfsd_matches_saved_identity \
+      "$PID" \
+      "$vol" \
+      "$DIR" \
+      "$PORT" \
+      "$RO" \
+      "$BOOT_ID" \
+      "$PID_START" &&
+      port_is_up "$PORT"; then
+    :
+  else
+    # If something already owns the endpoint but we cannot prove it is the
+    # recorded daemon for this exact export, fail closed. Never mount against an
+    # unidentified service.
     if port_is_up "$PORT"; then
-      warn "cannot restore share '$vol': port $PORT is already in use"
+      warn "cannot restore share '$vol': port $PORT is occupied but the saved NFS server identity could not be verified"
       return 1
     fi
 
@@ -520,22 +683,24 @@ restore_share_locked() {
       sleep 0.1
     done
 
-    if ! kill -0 "$pid" 2>/dev/null || ! port_is_up "$PORT"; then
+    if ! unfsd_process_matches_config \
+        "$pid" "$vol" "$DIR" "$PORT" "$RO" ||
+        ! port_is_up "$PORT"; then
       kill "$pid" 2>/dev/null || true
       wait "$pid" 2>/dev/null || true
-      warn "failed to restore NFS server for '$vol' on port $PORT"
+      warn "failed to restore verified NFS server for '$vol' on port $PORT"
       return 1
     fi
 
     PID="$pid"
 
-    # Persist the replacement PID before attempting to repair the runtime mount.
-    # If the mount fails later, the next retry sees the live replacement server.
+    # Persist the replacement process identity before repairing the runtime
+    # mount. A retry can then distinguish this exact daemon from PID reuse.
     if ! write_share_state_atomic \
         "$statef" "$DIR" "$vol" "$PORT" "$PID" "$RO"; then
       kill "$pid" 2>/dev/null || true
       wait "$pid" 2>/dev/null || true
-      warn "failed to persist restored NFS server state for '$vol'"
+      warn "failed to persist restored NFS server identity for '$vol'"
       return 1
     fi
   fi
@@ -559,7 +724,6 @@ restore_share_locked() {
 
   log "share ready: $DIR -> volume '$vol' (port $PORT)"
 }
-
 # restore_share <volume>
 #
 # Recovery uses the same per-volume lifecycle lock as share creation/reuse and
@@ -864,11 +1028,16 @@ reconcile_shares() {
 
     # shellcheck disable=SC1090
     (
-      local DIR="" VOLUME="" PORT="" PID="" RO=""
+      local DIR="" VOLUME="" PORT="" PID="" RO="" BOOT_ID="" PID_START=""
       source "$f"
 
       if [[ -n "$PID" ]]; then
-        kill "$PID" 2>/dev/null || true
+        if unfsd_matches_saved_identity \
+            "$PID" "$vol" "$DIR" "$PORT" "$RO" "$BOOT_ID" "$PID_START"; then
+          kill "$PID" 2>/dev/null || true
+        elif kill -0 "$PID" 2>/dev/null; then
+          warn "not stopping pid $PID for '$vol': saved NFS server identity does not match the live process"
+        fi
       fi
     )
 
