@@ -35,9 +35,10 @@
 set -euo pipefail
 
 # wslc-remote serves each host bind over NFS using a single userspace NFSv3
-# server: UNFS3's `unfsd` (https://github.com/unfs3/unfs3). That binary is the
-# only extra dependency — nothing ships in this repo. Install it from that repo
-# and put it on PATH (or point WSLC_REMOTE_UNFSD=/path at an existing binary).
+# server: UNFS3's `unfsd` (https://github.com/unfs3/unfs3). Nothing ships in
+# this repo; `flock` from util-linux is also required for lifecycle locking.
+# Install unfsd from that repo and put it on PATH (or point
+# WSLC_REMOTE_UNFSD=/path at an existing binary).
 #
 # unfsd is launched with -s (single-user: all I/O as the invoking user, so a
 # container's volume-init chown/chmod SETATTR succeeds), -p (never register with
@@ -144,6 +145,110 @@ alloc_port() {
 
 port_is_up()  { timeout 3 bash -c "exec 3<>/dev/tcp/$LOOPBACK/$1" 2>/dev/null; }
 vol_mounted() { session_run sh -c "grep -q ' /var/lib/docker/volumes/$1/_data nfs ' /proc/mounts" 2>/dev/null; }
+
+# vol_mount_healthy <volume> <hostdir>
+#
+# A mount-table entry and a successful stat are not sufficient: after the
+# exported directory is renamed/recreated, an old NFS root handle may continue
+# resolving successfully to the old inode. UNFS3 exposes the source inode as the
+# NFS fileid, so require the mounted root to match the directory currently being
+# exported. The runtime-side lookup is bounded so a broken NFS mount cannot hang
+# `wslc start` indefinitely.
+vol_mount_healthy() {
+  local vol="$1"
+  local dir="$2"
+
+  local source_inode
+  local mount_inode
+
+  [[ -d "$dir" ]] || return 1
+  vol_mounted "$vol" || return 1
+
+  source_inode="$(stat -Lc '%i' "$dir" 2>/dev/null)" || return 1
+  [[ "$source_inode" =~ ^[0-9]+$ ]] || return 1
+
+  if ! mount_inode="$(
+    timeout 5 "$WSLC" system session run \
+      stat -Lc '%i' "/var/lib/docker/volumes/$vol/_data/." \
+      </dev/null 2>/dev/null |
+      tr -d '\r\n'
+  )"; then
+    return 1
+  fi
+
+  [[ "$mount_inode" =~ ^[0-9]+$ ]] || return 1
+  [[ "$mount_inode" == "$source_inode" ]]
+}
+
+# running_volume_users <volume>
+#
+# Print running container IDs that currently reference the backing volume.
+running_volume_users() {
+  session_run docker ps -q --filter "volume=$1" 2>/dev/null |
+    tr -d '\r'
+}
+
+# ensure_volume_mount_healthy <volume> <hostdir> <port>
+#
+# Keep a healthy existing mount. Missing or stale mounts may be recreated only
+# when no running container currently uses the volume; remounting underneath a
+# running container could leave its mount namespace inconsistent.
+ensure_volume_mount_healthy() {
+  local vol="$1"
+  local dir="$2"
+  local port="$3"
+
+  local mounted=0
+  local users=""
+
+  if vol_mounted "$vol"; then
+    if vol_mount_healthy "$vol" "$dir"; then
+      return 0
+    fi
+    mounted=1
+  fi
+
+  if ! users="$(running_volume_users "$vol")"; then
+    warn "cannot determine whether running containers use '$vol'; refusing mount repair"
+    return 1
+  fi
+
+  if [[ -n "$users" ]]; then
+    users="${users//$'\n'/,}"
+    warn "NFS backing mount for '$vol' is missing or unhealthy, but running container(s) use it: $users. Stop them and retry."
+    return 1
+  fi
+
+  if (( mounted )); then
+    log "repairing unhealthy NFS backing mount for '$vol'"
+
+    if ! session_run sh -c "
+      T=/var/lib/docker/volumes/$vol/_data
+      umount -f \"\$T\" 2>/dev/null ||
+        umount -l \"\$T\" 2>/dev/null
+    "; then
+      warn "failed to unmount unhealthy backing store for '$vol'"
+      return 1
+    fi
+  else
+    log "remounting backing store for '$vol'"
+  fi
+
+  if ! session_run sh -c "
+    T=/var/lib/docker/volumes/$vol/_data
+    mkdir -p \"\$T\"
+    mount -i -t nfs -o $(nfs_opts "$port") :$dir \"\$T\"
+  "; then
+    warn "failed to mount backing store for '$vol'"
+    return 1
+  fi
+
+  if ! vol_mount_healthy "$vol" "$dir"; then
+    warn "backing store for '$vol' is still unhealthy after remount"
+    return 1
+  fi
+}
+
 
 # ---------------------------------------------------------------------------
 # abort_share <vol> <pid> : roll back a partially-created share so that a failure
@@ -354,6 +459,45 @@ unfsd_matches_saved_identity() {
   unfsd_process_matches_config \
     "$pid" "$vol" "$dir" "$port" "$ro"
 }
+# state_has_saved_identity_field <statefile>
+#
+# True when the record contains any new-format process-lifetime identity field.
+# A partial record is intentionally included so it cannot fall back to legacy
+# cleanup semantics.
+state_has_saved_identity_field() {
+  grep -Eq '^(BOOT_ID|PID_START)=' "$1" 2>/dev/null
+}
+
+# saved_unfsd_lifetime_gone <pid> <boot-id> <pid-start>
+#
+# Return success only when the persisted process lifetime is conclusively gone:
+# another WSL boot, the PID no longer exists in the same boot, or that PID now
+# belongs to a different process lifetime. Unknown/partial identity fails closed.
+saved_unfsd_lifetime_gone() {
+  local pid="$1"
+  local saved_boot="$2"
+  local saved_start="$3"
+
+  local boot
+  local start
+
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  [[ -n "$saved_boot" && -n "$saved_start" ]] || return 1
+
+  boot="$(current_boot_id)" || return 1
+
+  if [[ "$boot" != "$saved_boot" ]]; then
+    return 0
+  fi
+
+  if [[ ! -d "/proc/$pid" ]]; then
+    return 0
+  fi
+
+  start="$(process_start_ticks "$pid")" || return 1
+
+  [[ "$start" != "$saved_start" ]]
+}
 # ensure_saved_unfsd_identity
 #   <statefile> <pid> <volume> <dir> <port> <ro> <boot-id> <pid-start>
 #
@@ -545,28 +689,41 @@ stop_share_locked() {
   # shellcheck disable=SC1090
   source "$statef"
 
-  # Upgrade a live legacy daemon before destructive teardown. If an endpoint is
-  # occupied but cannot be tied to this share, fail closed and retain tracking.
-  if [[ -n "$PID" ]] && kill -0 "$PID" 2>/dev/null; then
-    if ensure_saved_unfsd_identity \
-        "$statef" "$PID" "$vol" "$DIR" "$PORT" "$RO" \
-        "$BOOT_ID" "$PID_START"; then
+  # Verify or migrate the saved server before destructive teardown.
+  #
+  # If verification fails, an occupied endpoint remains fail-closed. With a
+  # free endpoint, new-format state may be cleaned only when boot/start identity
+  # proves that the recorded daemon lifetime is gone. Never signal a recycled
+  # PID. Legacy state remains conservative when a saved PID is still alive.
+  if ensure_saved_unfsd_identity \
+      "$statef" "$PID" "$vol" "$DIR" "$PORT" "$RO" \
+      "$BOOT_ID" "$PID_START"; then
 
-      server_verified=1
-      BOOT_ID=""
-      PID_START=""
+    server_verified=1
+    BOOT_ID=""
+    PID_START=""
 
-      # shellcheck disable=SC1090
-      source "$statef"
+    # shellcheck disable=SC1090
+    source "$statef"
 
-    else
-      warn "cannot safely tear down share '$vol': live saved process identity could not be verified"
+  else
+    if [[ -n "$PORT" ]] && port_is_up "$PORT"; then
+      warn "cannot safely tear down share '$vol': NFS endpoint identity could not be verified"
       return 1
     fi
 
-  elif [[ -n "$PORT" ]] && port_is_up "$PORT"; then
-    warn "cannot safely tear down share '$vol': NFS endpoint is occupied but its saved process is unavailable"
-    return 1
+    if state_has_saved_identity_field "$statef"; then
+      if saved_unfsd_lifetime_gone "$PID" "$BOOT_ID" "$PID_START"; then
+        log "saved NFS server lifetime for '$vol' is gone; cleaning state without signaling pid ${PID:-<unknown>}"
+      else
+        warn "cannot safely tear down share '$vol': saved process lifetime could not be proven gone"
+        return 1
+      fi
+
+    elif [[ -n "$PID" ]] && kill -0 "$PID" 2>/dev/null; then
+      warn "cannot safely tear down legacy share '$vol': live saved process could not be verified"
+      return 1
+    fi
   fi
 
   local cids
@@ -805,18 +962,8 @@ restore_share_locked() {
   "$WSLC" volume create --driver guest "$vol" \
     >/dev/null 2>&1 </dev/null || true
 
-  if ! vol_mounted "$vol"; then
-    log "remounting backing store for '$vol'"
-
-    if ! session_run sh -c "
-      T=/var/lib/docker/volumes/$vol/_data
-      mkdir -p \"\$T\"
-      grep -q \" \$T nfs \" /proc/mounts ||
-        mount -i -t nfs -o $(nfs_opts "$PORT") :$DIR \"\$T\"
-    "; then
-      warn "failed to remount backing store for '$vol'"
-      return 1
-    fi
+  if ! ensure_volume_mount_healthy "$vol" "$DIR" "$PORT"; then
+    return 1
   fi
 
   log "share ready: $DIR -> volume '$vol' (port $PORT)"
@@ -1131,28 +1278,38 @@ reconcile_shares() {
     # shellcheck disable=SC1090
     source "$f"
 
-    if [[ -n "$PID" ]] && kill -0 "$PID" 2>/dev/null; then
-      if ensure_saved_unfsd_identity \
-          "$f" "$PID" "$vol" "$DIR" "$PORT" "$RO" \
-          "$BOOT_ID" "$PID_START"; then
+    if ensure_saved_unfsd_identity \
+        "$f" "$PID" "$vol" "$DIR" "$PORT" "$RO" \
+        "$BOOT_ID" "$PID_START"; then
 
-        server_verified=1
-        BOOT_ID=""
-        PID_START=""
+      server_verified=1
+      BOOT_ID=""
+      PID_START=""
 
-        # shellcheck disable=SC1090
-        source "$f"
+      # shellcheck disable=SC1090
+      source "$f"
 
-      else
-        warn "cannot reconcile share '$vol': live saved process identity could not be verified; keeping state"
+    else
+      if [[ -n "$PORT" ]] && port_is_up "$PORT"; then
+        warn "cannot reconcile share '$vol': NFS endpoint identity could not be verified; keeping state"
         rc=1
         continue
       fi
 
-    elif [[ -n "$PORT" ]] && port_is_up "$PORT"; then
-      warn "cannot reconcile share '$vol': NFS endpoint is occupied but its saved process is unavailable; keeping state"
-      rc=1
-      continue
+      if state_has_saved_identity_field "$f"; then
+        if saved_unfsd_lifetime_gone "$PID" "$BOOT_ID" "$PID_START"; then
+          log "saved NFS server lifetime for '$vol' is gone; cleaning state without signaling pid ${PID:-<unknown>}"
+        else
+          warn "cannot reconcile share '$vol': saved process lifetime could not be proven gone; keeping state"
+          rc=1
+          continue
+        fi
+
+      elif [[ -n "$PID" ]] && kill -0 "$PID" 2>/dev/null; then
+        warn "cannot reconcile legacy share '$vol': live saved process could not be verified; keeping state"
+        rc=1
+        continue
+      fi
     fi
 
     log "share '$vol' backing volume gone; stopping server + cleaning state"
