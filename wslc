@@ -354,6 +354,62 @@ unfsd_matches_saved_identity() {
   unfsd_process_matches_config \
     "$pid" "$vol" "$dir" "$port" "$ro"
 }
+# ensure_saved_unfsd_identity
+#   <statefile> <pid> <volume> <dir> <port> <ro> <boot-id> <pid-start>
+#
+# Existing records created before process identity tracking contain neither
+# BOOT_ID nor PID_START. Such a record may be upgraded in place only after the
+# live process is independently verified as the exact unfsd instance configured
+# for this share.
+#
+# If either identity key is already present, the record is not legacy. Both keys
+# must be present and their persisted identity must match; mismatched or partial
+# new-format records are never repaired automatically.
+ensure_saved_unfsd_identity() {
+  local statef="$1"
+  local pid="$2"
+  local vol="$3"
+  local dir="$4"
+  local port="$5"
+  local ro="${6:-}"
+  local saved_boot="$7"
+  local saved_start="$8"
+
+  local has_boot=0
+  local has_start=0
+
+  grep -q '^BOOT_ID=' "$statef" 2>/dev/null && has_boot=1
+  grep -q '^PID_START=' "$statef" 2>/dev/null && has_start=1
+
+  # Any identity field means this is a new-format record. Never reinterpret a
+  # malformed or mismatched new record as legacy state.
+  if (( has_boot || has_start )); then
+    (( has_boot && has_start )) || return 1
+    [[ -n "$saved_boot" && -n "$saved_start" ]] || return 1
+
+    unfsd_matches_saved_identity \
+      "$pid" "$vol" "$dir" "$port" "$ro" \
+      "$saved_boot" "$saved_start"
+    return
+  fi
+
+  # Genuine legacy record: trust it only after independently verifying the
+  # executable, complete daemon arguments and exports configuration.
+  if ! unfsd_process_matches_config \
+      "$pid" "$vol" "$dir" "$port" "$ro"; then
+    return 1
+  fi
+
+  log "migrating legacy share state for volume '$vol'"
+
+  if ! write_share_state_atomic \
+      "$statef" "$dir" "$vol" "$port" "$pid" "$ro"; then
+    warn "failed to migrate legacy share state for '$vol'"
+    return 1
+  fi
+
+  return 0
+}
 # share_locked <hostdir> [ro] <volume>
 #
 # Caller must hold the per-volume lifecycle lock.
@@ -472,7 +528,14 @@ stop_share_locked() {
   local vol="$1"
   local statef="$SHARES_DIR/$vol.env"
 
-  local DIR="" VOLUME="" PORT="" PID="" RO="" BOOT_ID="" PID_START=""
+  local DIR=""
+  local VOLUME=""
+  local PORT=""
+  local PID=""
+  local RO=""
+  local BOOT_ID=""
+  local PID_START=""
+  local server_verified=0
 
   [[ -f "$statef" ]] || {
     warn "no such share: $vol"
@@ -482,8 +545,30 @@ stop_share_locked() {
   # shellcheck disable=SC1090
   source "$statef"
 
-  # Guest volumes are docker local volumes in the runtime dockerd. Explicit
-  # teardown removes containers still holding the volume before volume removal.
+  # Upgrade a live legacy daemon before destructive teardown. If an endpoint is
+  # occupied but cannot be tied to this share, fail closed and retain tracking.
+  if [[ -n "$PID" ]] && kill -0 "$PID" 2>/dev/null; then
+    if ensure_saved_unfsd_identity \
+        "$statef" "$PID" "$vol" "$DIR" "$PORT" "$RO" \
+        "$BOOT_ID" "$PID_START"; then
+
+      server_verified=1
+      BOOT_ID=""
+      PID_START=""
+
+      # shellcheck disable=SC1090
+      source "$statef"
+
+    else
+      warn "cannot safely tear down share '$vol': live saved process identity could not be verified"
+      return 1
+    fi
+
+  elif [[ -n "$PORT" ]] && port_is_up "$PORT"; then
+    warn "cannot safely tear down share '$vol': NFS endpoint is occupied but its saved process is unavailable"
+    return 1
+  fi
+
   local cids
 
   cids="$(
@@ -508,13 +593,14 @@ stop_share_locked() {
     || session_run docker volume rm "$vol" >/dev/null 2>&1 \
     || warn "could not remove volume '$vol' (a container may still use it)"
 
-  if [[ -n "$PID" ]]; then
+  if (( server_verified )); then
     if unfsd_matches_saved_identity \
         "$PID" "$vol" "$DIR" "$PORT" "$RO" "$BOOT_ID" "$PID_START"; then
       log "stopping NFS server (pid $PID)"
       kill "$PID" 2>/dev/null || true
+
     elif kill -0 "$PID" 2>/dev/null; then
-      warn "not stopping pid $PID for '$vol': saved NFS server identity does not match the live process"
+      warn "not stopping pid $PID for '$vol': saved NFS server identity changed during teardown"
     fi
   fi
 
@@ -523,7 +609,6 @@ stop_share_locked() {
     "$STATE_DIR/$vol.log" \
     "$STATE_DIR/$vol.exports"
 }
-
 # stop_share <volume>
 #
 # Explicit teardown participates in the same lifecycle lock as creation and
@@ -579,13 +664,10 @@ write_share_state_atomic() {
   local pid_start
 
   # Never persist a server identity unless the process itself matches the exact
-  # unfsd configuration and its configured endpoint is actually reachable.
+  # unfsd configuration. Endpoint reachability is checked by creation/recovery
+  # before they expose the share.
   if ! unfsd_process_matches_config \
       "$pid" "$vol" "$dir" "$port" "$ro"; then
-    return 1
-  fi
-
-  if ! port_is_up "$port"; then
     return 1
   fi
 
@@ -620,8 +702,6 @@ restore_share_locked() {
   local vol="$1"
   local statef="$SHARES_DIR/$vol.env"
 
-  # Keep sourced state local to this invocation. This prevents stale shell
-  # values from hiding malformed or incomplete state.
   local DIR=""
   local VOLUME=""
   local PORT=""
@@ -629,6 +709,7 @@ restore_share_locked() {
   local RO=""
   local BOOT_ID=""
   local PID_START=""
+  local identity_ok=0
 
   [[ -f "$statef" ]] || return 0
 
@@ -647,27 +728,45 @@ restore_share_locked() {
 
   ensure_server
 
-  # Reuse a live server only when its persisted process lifetime and complete
-  # unfsd configuration match this share. PID existence and port reachability
-  # alone are deliberately insufficient because both can be independently
-  # reused after a restart.
-  if unfsd_matches_saved_identity \
+  if ensure_saved_unfsd_identity \
+      "$statef" \
       "$PID" \
       "$vol" \
       "$DIR" \
       "$PORT" \
       "$RO" \
       "$BOOT_ID" \
-      "$PID_START" &&
-      port_is_up "$PORT"; then
+      "$PID_START"; then
+
+    identity_ok=1
+
+    # A legacy migration may just have added these fields. Reload the atomic
+    # record so subsequent strict checks use the persisted identity.
+    BOOT_ID=""
+    PID_START=""
+
+    # shellcheck disable=SC1090
+    source "$statef"
+  fi
+
+  if (( identity_ok )) && port_is_up "$PORT"; then
     :
   else
-    # If something already owns the endpoint but we cannot prove it is the
-    # recorded daemon for this exact export, fail closed. Never mount against an
-    # unidentified service.
+    # An occupied endpoint whose process identity is unknown must never be used
+    # as this share's NFS server.
     if port_is_up "$PORT"; then
       warn "cannot restore share '$vol': port $PORT is occupied but the saved NFS server identity could not be verified"
       return 1
+    fi
+
+    # A verified daemon that is alive but no longer serving its endpoint may be
+    # safely stopped before replacing it. Revalidate immediately before kill so
+    # PID reuse cannot turn this cleanup into termination of an unrelated process.
+    if (( identity_ok )) &&
+       unfsd_matches_saved_identity \
+          "$PID" "$vol" "$DIR" "$PORT" "$RO" "$BOOT_ID" "$PID_START"; then
+      kill "$PID" 2>/dev/null || true
+      wait "$PID" 2>/dev/null || true
     fi
 
     log "restoring NFS share: $DIR -> volume '$vol' (port $PORT)"
@@ -694,8 +793,6 @@ restore_share_locked() {
 
     PID="$pid"
 
-    # Persist the replacement process identity before repairing the runtime
-    # mount. A retry can then distinguish this exact daemon from PID reuse.
     if ! write_share_state_atomic \
         "$statef" "$DIR" "$vol" "$PORT" "$PID" "$RO"; then
       kill "$pid" 2>/dev/null || true
@@ -1003,10 +1100,8 @@ reconcile_shares() {
   local f
   local vol
   local volumes
+  local rc=0
 
-  # Called while handle_volume owns the exclusive lifecycle barrier. Query the
-  # runtime's actual volume set instead of using mount state: an existing share
-  # may legitimately be temporarily unmounted and recoverable.
   if ! volumes="$(
     session_run docker volume ls --format '{{.Name}}' 2>/dev/null |
       tr -d '\r'
@@ -1024,28 +1119,63 @@ reconcile_shares() {
       continue
     fi
 
-    log "share '$vol' backing volume gone; stopping server + cleaning state"
+    local DIR=""
+    local VOLUME=""
+    local PORT=""
+    local PID=""
+    local RO=""
+    local BOOT_ID=""
+    local PID_START=""
+    local server_verified=0
 
     # shellcheck disable=SC1090
-    (
-      local DIR="" VOLUME="" PORT="" PID="" RO="" BOOT_ID="" PID_START=""
-      source "$f"
+    source "$f"
 
-      if [[ -n "$PID" ]]; then
-        if unfsd_matches_saved_identity \
-            "$PID" "$vol" "$DIR" "$PORT" "$RO" "$BOOT_ID" "$PID_START"; then
-          kill "$PID" 2>/dev/null || true
-        elif kill -0 "$PID" 2>/dev/null; then
-          warn "not stopping pid $PID for '$vol': saved NFS server identity does not match the live process"
-        fi
+    if [[ -n "$PID" ]] && kill -0 "$PID" 2>/dev/null; then
+      if ensure_saved_unfsd_identity \
+          "$f" "$PID" "$vol" "$DIR" "$PORT" "$RO" \
+          "$BOOT_ID" "$PID_START"; then
+
+        server_verified=1
+        BOOT_ID=""
+        PID_START=""
+
+        # shellcheck disable=SC1090
+        source "$f"
+
+      else
+        warn "cannot reconcile share '$vol': live saved process identity could not be verified; keeping state"
+        rc=1
+        continue
       fi
-    )
+
+    elif [[ -n "$PORT" ]] && port_is_up "$PORT"; then
+      warn "cannot reconcile share '$vol': NFS endpoint is occupied but its saved process is unavailable; keeping state"
+      rc=1
+      continue
+    fi
+
+    log "share '$vol' backing volume gone; stopping server + cleaning state"
+
+    if (( server_verified )); then
+      if unfsd_matches_saved_identity \
+          "$PID" "$vol" "$DIR" "$PORT" "$RO" "$BOOT_ID" "$PID_START"; then
+        kill "$PID" 2>/dev/null || true
+
+      elif kill -0 "$PID" 2>/dev/null; then
+        warn "cannot safely clean share '$vol': server identity changed during reconciliation; keeping state"
+        rc=1
+        continue
+      fi
+    fi
 
     rm -f \
       "$f" \
       "$STATE_DIR/$vol.log" \
       "$STATE_DIR/$vol.exports"
   done
+
+  return "$rc"
 }
 # ---------------------------------------------------------------------------
 # check_deps : verify required userspace tools plus the wslc pieces

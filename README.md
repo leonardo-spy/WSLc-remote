@@ -80,7 +80,9 @@ wslc start my-container        # restores the share first, then starts it
 to the real WSLC start command. This allows a stopped container to recover after the WSL distro
 or container runtime VM has stopped without recreating the container. Recovery validates the
 saved `unfsd` process identity and export configuration before reusing a live NFS endpoint; an
-occupied endpoint whose identity cannot be verified is rejected rather than mounted.
+occupied endpoint whose identity cannot be verified is rejected rather than mounted. Tracked
+shares created by older versions are migrated in place when their running `unfsd` instance can
+be independently verified.
 
 `wslc volume remove` / `wslc volume prune` also tear down the matching NFS share. All other
 `volume` subcommands pass straight through.
