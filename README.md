@@ -68,7 +68,15 @@ wslc run --mount type=bind,source=$(pwd),target=/work --rm alpine sh
 # everything else is forwarded straight to the real wslc
 wslc images
 wslc inspect my-container
+
+# stopped containers keep using their existing NFS-backed shares
+wslc stop my-container
+wslc start my-container        # restores the share first, then starts it
 ```
+
+`wslc start` restores any tracked NFS shares used by the existing container before delegating
+to the real WSLC start command. This allows a stopped container to recover after the WSL distro
+or container runtime VM has stopped without recreating the container.
 
 `wslc volume remove` / `wslc volume prune` also tear down the matching NFS share. All other
 `volume` subcommands pass straight through.

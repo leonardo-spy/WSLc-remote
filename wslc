@@ -12,6 +12,8 @@
 #                 share, then the real `wslc` command is exec'd. Multiple binds
 #                 are handled; named volumes / tmpfs / non-dir sources pass
 #                 through untouched.
+#   start         Restore any tracked NFS-backed volumes used by the existing
+#                 container before forwarding to the real `wslc start`.
 #   volume        `remove`/`prune` also tear down (and reconcile) the matching
 #                 wslc-remote NFS share; every other volume subcommand passes
 #                 straight through to `wslc volume`.
@@ -257,6 +259,144 @@ stop_share() {
 }
 
 # ---------------------------------------------------------------------------
+# Restore existing wslc-remote shares used by stopped containers.
+#
+# Unlike share(), this path MUST be non-destructive: starting an existing
+# container must never remove/recreate that container merely because its NFS
+# server or runtime mount disappeared.
+#
+# This is primarily needed after the WSL distro or the container runtime VM has
+# stopped. The container still references the same wslc guest volume, but the
+# userspace NFS server and/or the NFS mount backing that volume may no longer
+# exist.
+#
+# restore_share <volume>
+restore_share() {
+  local vol="$1"
+  local statef="$SHARES_DIR/$vol.env"
+
+  [[ -f "$statef" ]] || return 0
+
+  # shellcheck disable=SC1090
+  source "$statef"
+
+  if [[ -z "${DIR:-}" || ! -d "$DIR" ]]; then
+    warn "cannot restore share '$vol': source directory no longer exists: ${DIR:-<unknown>}"
+    return 1
+  fi
+
+  if [[ -z "${PORT:-}" ]]; then
+    warn "cannot restore share '$vol': no port recorded in $statef"
+    return 1
+  fi
+
+  ensure_server
+
+  # If the original unfsd process disappeared, restart the same export on the
+  # same port. Existing NFS mounts already reference this endpoint and can
+  # recover once the server comes back.
+  if ! {
+    [[ -n "${PID:-}" ]] &&
+    kill -0 "$PID" 2>/dev/null &&
+    port_is_up "$PORT"
+  }; then
+
+    # Do not steal a port from an unrelated process.
+    if port_is_up "$PORT"; then
+      warn "cannot restore share '$vol': port $PORT is already in use"
+      return 1
+    fi
+
+    log "restoring NFS share: $DIR -> volume '$vol' (port $PORT)"
+
+    start_nfsd "$vol" "$DIR" "$PORT" "${RO:-}"
+
+    local pid="$NFSD_PID"
+    local i
+
+    for (( i=0; i<50; i++ )); do
+      kill -0 "$pid" 2>/dev/null || break
+      port_is_up "$PORT" && break
+      sleep 0.1
+    done
+
+    if ! kill -0 "$pid" 2>/dev/null || ! port_is_up "$PORT"; then
+      kill "$pid" 2>/dev/null || true
+      warn "failed to restore NFS server for '$vol' on port $PORT"
+      return 1
+    fi
+
+    PID="$pid"
+  fi
+
+  # The runtime VM may also have restarted. Ensure the guest volume exists and
+  # restore the NFS mount on its backing directory when necessary.
+  "$WSLC" volume create --driver guest "$vol" \
+    >/dev/null 2>&1 </dev/null || true
+
+  if ! vol_mounted "$vol"; then
+    log "remounting backing store for '$vol'"
+
+    if ! session_run sh -c "
+      T=/var/lib/docker/volumes/$vol/_data
+      mkdir -p \"\$T\"
+      grep -q \" \$T nfs \" /proc/mounts ||
+        mount -i -t nfs -o $(nfs_opts "$PORT") :$DIR \"\$T\"
+    "; then
+      warn "failed to remount backing store for '$vol'"
+      return 1
+    fi
+  fi
+
+  # Refresh the persisted PID when unfsd had to be restarted.
+  cat > "$statef" <<EOF
+DIR=$DIR
+VOLUME=$vol
+PORT=$PORT
+PID=${PID:-}
+RO=${RO:-}
+EOF
+
+  log "share ready: $DIR -> volume '$vol' (port $PORT)"
+}
+
+# restore_container_shares <container>
+#
+# Inspect the existing container in the runtime VM and restore only volumes
+# tracked by wslc-remote. Ordinary named volumes are intentionally ignored.
+restore_container_shares() {
+  local container="$1"
+  local vol
+  local rc=0
+  local mounts
+
+  ensure_state
+
+  # If the container does not exist, leave error reporting to the real wslc
+  # command so this wrapper remains transparent.
+  if ! mounts="$(
+    session_run docker inspect \
+      --format '{{range .Mounts}}{{if eq .Type "volume"}}{{println .Name}}{{end}}{{end}}' \
+      "$container" 2>/dev/null |
+      tr -d '\r'
+  )"; then
+    return 0
+  fi
+
+  while IFS= read -r vol; do
+    [[ -n "$vol" ]] || continue
+
+    # Only restore volumes created and tracked by wslc-remote.
+    [[ -f "$SHARES_DIR/$vol.env" ]] || continue
+
+    if ! restore_share "$vol"; then
+      rc=1
+    fi
+  done <<< "$mounts"
+
+  return "$rc"
+}
+# ---------------------------------------------------------------------------
 # Bind-mount detection + rewriting.
 
 # Does this `-v` source refer to a host path (vs a named volume)?
@@ -337,7 +477,47 @@ run_wslc() {
   exec "$WSLC" "$sub" "${out[@]}"
 }
 
-# handle_volume <volume subcommand> <args...> : a drop-in for `wslc volume` that
+# handle_start <args...> : restore any wslc-remote shares referenced by the
+# existing container before delegating to the real `wslc start`.
+#
+# Container configuration is not recreated or rewritten here. This mirrors the
+# normal container lifecycle semantics: start operates on the existing container.
+handle_start() {
+  local -a args=("$@")
+  local container=""
+  local arg
+
+  # Current wslc start accepts one container ID/name plus flag-only options
+  # such as --attach / --interactive. Find the first positional argument.
+  for arg in "${args[@]}"; do
+    case "$arg" in
+      -a|--attach|-i|--interactive)
+        ;;
+      --)
+        ;;
+      -*)
+        ;;
+      *)
+        container="$arg"
+        break
+        ;;
+    esac
+  done
+
+  # Let the real CLI produce its native usage/error message if no container was
+  # supplied instead of duplicating argument validation here.
+  if [[ -z "$container" ]]; then
+    exec "$WSLC" start "${args[@]}"
+  fi
+
+  if ! restore_container_shares "$container"; then
+    die "failed to restore one or more remote shares for container '$container'"
+  fi
+
+  exec "$WSLC" start "${args[@]}"
+}
+
+# ---------------------------------------------------------------------------# handle_volume <volume subcommand> <args...> : a drop-in for `wslc volume` that
 # is aware of wslc-remote's NFS-backed shares. `remove`/`rm` of a tracked share
 # tears the whole share down (server + mount + state), and `prune` reconciles any
 # shares whose backing volume it removed. Everything else passes straight through.
@@ -448,6 +628,8 @@ Commands are handled as follows:
   run, create        Drop-in for 'wslc run'/'wslc create': every host bind mount
                      (-v /host:/ctr, --mount type=bind,...) is transparently
                      served over NFS instead of the slow default virtiofs share.
+  start              Restores NFS-backed shares used by an existing container,
+                     then delegates to the real 'wslc start'.
   volume             Drop-in for 'wslc volume': 'remove'/'prune' also tear down
                      the matching wslc-remote NFS share; all else passes through.
   <anything else>    Forwarded unchanged to 'wslc' (inspect, images, logs, exec,
@@ -480,6 +662,7 @@ EOF
 cmd="${1:-}"; shift || true
 case "$cmd" in
   run|create)         run_wslc "$cmd" "$@" ;;
+  start)              handle_start "$@" ;;
   volume)             handle_volume "$@" ;;
   _check)             check_deps "$@" ;;
   _help|"")           usage ;;
