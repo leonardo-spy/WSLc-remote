@@ -441,18 +441,64 @@ restore_container_shares() {
   local vol
   local rc=0
   local mounts
+  local native_out
+  local native_err
+  local native_rc
+  local native_errf
+  local normalized_out
 
   ensure_state
 
-  # If the container does not exist, leave error reporting to the real wslc
-  # command so this wrapper remains transparent.
-  if ! mounts="$(
+  if mounts="$(
     session_run docker inspect \
       --format '{{range .Mounts}}{{if eq .Type "volume"}}{{println .Name}}{{end}}{{end}}' \
       "$container" 2>/dev/null |
       tr -d '\r'
   )"; then
-    return 0
+    :
+  else
+    # A runtime-side docker inspect failure is not enough to conclude that the
+    # container is missing. Ask native WSLC to inspect the same object.
+    #
+    # Native `container inspect` prints an empty JSON array when no object
+    # matches. Keep stdout and stderr separate so this classification does not
+    # depend on localized human-readable error text.
+    native_errf="$(mktemp "$STATE_DIR/inspect-error.XXXXXX")" || {
+      warn "cannot create temporary file while inspecting container '$container'"
+      return 1
+    }
+
+    if native_out="$("$WSLC" container inspect "$container" 2>"$native_errf")"; then
+      native_rc=0
+    else
+      native_rc=$?
+    fi
+
+    native_err="$(cat "$native_errf")"
+    rm -f "$native_errf"
+
+    native_out="${native_out//$'\r'/}"
+    native_err="${native_err//$'\r'/}"
+    normalized_out="$(printf '%s' "$native_out" | tr -d '[:space:]')"
+
+    if [[ $native_rc -ne 0 && "$normalized_out" == "[]" ]]; then
+      # Absence is confirmed. Preserve native `wslc start` error reporting by
+      # returning success here and letting handle_start delegate to the real CLI.
+      return 0
+    fi
+
+    if [[ $native_rc -eq 0 ]]; then
+      # Native WSLC confirms that the container exists, so starting it without
+      # knowing its mounts would risk exposing an unmounted backing directory.
+      warn "failed to inspect mounts for existing container '$container'; refusing to start without restoring remote shares"
+      return 1
+    fi
+
+    # Native inspection itself failed for some reason other than a confirmed
+    # missing object. Fail closed rather than starting with unknown mount state.
+    warn "failed to inspect container '$container'; refusing to start without restoring remote shares"
+    [[ -n "$native_err" ]] && printf '%s\n' "$native_err" >&2
+    return 1
   fi
 
   while IFS= read -r vol; do
