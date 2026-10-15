@@ -669,7 +669,7 @@ ensure_saved_unfsd_identity() {
 }
 # share_locked <hostdir> [ro] <volume>
 #
-# Caller must hold the per-volume lifecycle lock.
+# Caller must hold the per-volume lifecycle lock or the exclusive lifecycle barrier.
 share_locked() {
   local dir="$1"
   local ro="${2:-}"
@@ -757,10 +757,22 @@ share() {
   local ro
   local vol
   local rc
+  local lifecycle_exclusive
 
   dir="$(cd "$1" 2>/dev/null && pwd)" || die "no such directory: $1"
   ro="${2:-}"
   vol="${3:-$(vol_name_for "$dir" "$ro")}"
+  lifecycle_exclusive="${4:-0}"
+
+  if (( lifecycle_exclusive )); then
+    if share_locked "$dir" "$ro" "$vol"; then
+      rc=0
+    else
+      rc=$?
+    fi
+
+    return "$rc"
+  fi
 
   if ! acquire_share_lock "$vol"; then
     die "failed to acquire lifecycle lock for share '$vol'"
@@ -1215,10 +1227,10 @@ is_host_path() {
 # read-only bind is exported read-only. On any non-host-dir / non-existent
 # source, set nothing and return 1 so the caller keeps the original source.
 nfsify_dir() {
-  local src="$1" ro="${2:-}" abs
+  local src="$1" ro="${2:-}" lifecycle_exclusive="${3:-0}" abs
   is_host_path "$src" || return 1
   abs="$(cd "$src" 2>/dev/null && pwd)" || { warn "bind source is not an existing directory, passing through: $src"; return 1; }
-  share "$abs" "$ro"
+  share "$abs" "$ro" "" "$lifecycle_exclusive"
   NFSIFY_VOL="$SHARE_VOL"
 }
 
@@ -1227,12 +1239,27 @@ nfsify_dir() {
 # A `ro` option makes the NFS export read-only too. Called directly (not in a
 # subshell) so a die() in sharing aborts the program.
 rewrite_v_spec() {
-  local spec="$1" src rest opts ro=""
-  [[ "$spec" == *:* ]] || { REWRITE_SPEC="$spec"; return; }   # anonymous volume, leave as-is
-  src="${spec%%:*}"; rest="${spec#*:}"
-  [[ "$rest" == *:* ]] && opts="${rest#*:}" || opts=""         # opts follow the DST (second colon)
-  case ",$opts," in *,ro,*) ro="ro" ;; esac
-  if nfsify_dir "$src" "$ro"; then REWRITE_SPEC="$NFSIFY_VOL:$rest"; else REWRITE_SPEC="$spec"; fi
+  local spec="$1"
+  local lifecycle_exclusive="${2:-0}"
+  local src rest opts ro=""
+
+  REWRITE_REMOTE_VOL=""
+
+  [[ "$spec" == *:* ]] || { REWRITE_SPEC="$spec"; return; }
+  src="${spec%%:*}"
+  rest="${spec#*:}"
+  [[ "$rest" == *:* ]] && opts="${rest#*:}" || opts=""
+
+  case ",$opts," in
+    *,ro,*) ro="ro" ;;
+  esac
+
+  if nfsify_dir "$src" "$ro" "$lifecycle_exclusive"; then
+    REWRITE_SPEC="$NFSIFY_VOL:$rest"
+    REWRITE_REMOTE_VOL="$NFSIFY_VOL"
+  else
+    REWRITE_SPEC="$spec"
+  fi
 }
 
 # Convert a `--mount` spec into an equivalent `-v` spec, stored in MOUNT_SPEC
@@ -1240,11 +1267,19 @@ rewrite_v_spec() {
 # NFS-ified; volume sources pass through as named volumes. Called directly (not
 # in a subshell) so a die() in sharing aborts the program.
 mount_to_v() {
-  local spec="$1" field key val src="" dst="" ro="" type=""
+  local spec="$1"
+  local lifecycle_exclusive="${2:-0}"
+  local field key val src="" dst="" ro="" type=""
   local -a fields=()
+
+  MOUNT_REMOTE_VOL=""
+
   while IFS= read -r field; do fields+=("$field"); done < <(printf '%s\n' "$spec" | tr ',' '\n')
+
   for field in "${fields[@]}"; do
-    key="${field%%=*}"; val="${field#*=}"
+    key="${field%%=*}"
+    val="${field#*=}"
+
     case "$key" in
       type)                    type="$val" ;;
       source|src)              src="$val" ;;
@@ -1252,32 +1287,199 @@ mount_to_v() {
       readonly|ro)             [[ "$val" != false ]] && ro="ro" ;;
     esac
   done
+
   [[ -n "$dst" ]] || die "--mount missing destination/target: $spec"
-  if [[ "$type" == bind || -z "$type" ]] && nfsify_dir "$src" "$ro"; then src="$NFSIFY_VOL"; fi
-  if [[ -n "$ro" ]]; then MOUNT_SPEC="$src:$dst:ro"; else MOUNT_SPEC="$src:$dst"; fi
+
+  if [[ "$type" == bind || -z "$type" ]] &&
+     nfsify_dir "$src" "$ro" "$lifecycle_exclusive"; then
+    src="$NFSIFY_VOL"
+    MOUNT_REMOTE_VOL="$NFSIFY_VOL"
+  fi
+
+  if [[ -n "$ro" ]]; then
+    MOUNT_SPEC="$src:$dst:ro"
+  else
+    MOUNT_SPEC="$src:$dst"
+  fi
 }
 
+runtime_running_container_ids() {
+  local ids
+
+  ids="$(
+    exec 199>&- 200>&-
+    session_run docker ps -q 2>/dev/null |
+      tr -d '\r'
+  )" || return 1
+
+  printf '%s\n' "$ids"
+}
+
+container_uses_all_volumes() {
+  local container="$1"
+  shift
+
+  local mounts
+  local vol
+
+  mounts="$(
+    exec 199>&- 200>&-
+    session_run docker inspect \
+      --format '{{range .Mounts}}{{if eq .Type "volume"}}{{println .Name}}{{end}}{{end}}' \
+      "$container" 2>/dev/null |
+      tr -d '\r'
+  )" || return 1
+
+  for vol in "$@"; do
+    grep -Fxq "$vol" <<< "$mounts" || return 1
+  done
+}
+
+handoff_run_barrier_until_new_volume_user() {
+  local baseline="$1"
+  shift
+
+  local -a volumes=("$@")
+
+  (
+    local ids
+    local id
+
+    while :; do
+      if ids="$(runtime_running_container_ids)"; then
+        while IFS= read -r id; do
+          [[ -n "$id" ]] || continue
+
+          if grep -Fxq "$id" <<< "$baseline"; then
+            continue
+          fi
+
+          if container_uses_all_volumes "$id" "${volumes[@]}"; then
+            exec 199>&-
+            exit 0
+          fi
+        done <<< "$ids"
+      fi
+
+      sleep 0.05
+    done
+  ) &
+
+  START_BARRIER_GUARD_PID=$!
+
+  # The monitor now owns the remaining locked open-file description.
+  exec 199>&-
+}
 # run_wslc <run|create> <args...> : transparently NFS-ify host binds, then run wslc.
 run_wslc() {
-  local sub="$1"; shift
+  local sub="$1"
+  shift
+
   [[ $# -ge 1 ]] || die "usage: wslc $sub <wslc $sub args...>"
+
   ensure_state
-  local out=() a
+
+  local -a out=()
+  local -a startup_volumes=()
+  local a
+  local rc=0
+  local baseline=""
+
+  # Bind rewriting, share creation/recovery and native startup form one
+  # lifecycle transaction. This also covers commands containing multiple binds.
+  if ! acquire_start_barrier; then
+    die "failed to acquire lifecycle barrier before wslc $sub"
+  fi
+
   while [[ $# -gt 0 ]]; do
     a="$1"
+
     case "$a" in
-      -v|--volume)        shift; [[ $# -gt 0 ]] || die "$a requires an argument"
-                          rewrite_v_spec "$1"; out+=(-v "$REWRITE_SPEC") ;;
-      -v=*|--volume=*)    rewrite_v_spec "${a#*=}"; out+=(-v "$REWRITE_SPEC") ;;
-      --mount)            shift; [[ $# -gt 0 ]] || die "--mount requires an argument"
-                          mount_to_v "$1"; out+=(-v "$MOUNT_SPEC") ;;
-      --mount=*)          mount_to_v "${a#*=}"; out+=(-v "$MOUNT_SPEC") ;;
-      *)                  out+=("$a") ;;
+      -v|--volume)
+        shift
+        [[ $# -gt 0 ]] || die "$a requires an argument"
+        rewrite_v_spec "$1" 1
+        out+=(-v "$REWRITE_SPEC")
+        [[ -n "$REWRITE_REMOTE_VOL" ]] &&
+          startup_volumes+=("$REWRITE_REMOTE_VOL")
+        ;;
+
+      -v=*|--volume=*)
+        rewrite_v_spec "${a#*=}" 1
+        out+=(-v "$REWRITE_SPEC")
+        [[ -n "$REWRITE_REMOTE_VOL" ]] &&
+          startup_volumes+=("$REWRITE_REMOTE_VOL")
+        ;;
+
+      --mount)
+        shift
+        [[ $# -gt 0 ]] || die "--mount requires an argument"
+        mount_to_v "$1" 1
+        out+=(-v "$MOUNT_SPEC")
+        [[ -n "$MOUNT_REMOTE_VOL" ]] &&
+          startup_volumes+=("$MOUNT_REMOTE_VOL")
+        ;;
+
+      --mount=*)
+        mount_to_v "${a#*=}" 1
+        out+=(-v "$MOUNT_SPEC")
+        [[ -n "$MOUNT_REMOTE_VOL" ]] &&
+          startup_volumes+=("$MOUNT_REMOTE_VOL")
+        ;;
+
+      *)
+        out+=("$a")
+        ;;
     esac
+
     shift
   done
+
   log "wslc $sub ${out[*]}"
-  exec "$WSLC" "$sub" "${out[@]}"
+
+  # No NFS-backed bind was produced. Nothing needs startup protection.
+  if (( ${#startup_volumes[@]} == 0 )); then
+    release_start_barrier
+    exec "$WSLC" "$sub" "${out[@]}"
+  fi
+
+  if [[ "$sub" == create ]]; then
+    # Create does not start the container. Keep protection until creation has
+    # committed the volume references; a later `start` performs its own guarded
+    # restore/start transaction.
+    if "$WSLC" "$sub" "${out[@]}" 199>&- 200>&-; then
+      rc=0
+    else
+      rc=$?
+    fi
+
+    release_start_barrier
+    return "$rc"
+  fi
+
+  # `run` may remain attached for the entire container lifetime. Snapshot
+  # existing running IDs, then transfer the lock to a monitor that releases it
+  # only when a NEW running container has consumed every rewritten NFS volume.
+  if ! baseline="$(runtime_running_container_ids)"; then
+    release_start_barrier
+    die "failed to snapshot running containers before wslc run"
+  fi
+
+  handoff_run_barrier_until_new_volume_user \
+    "$baseline" "${startup_volumes[@]}"
+
+  if "$WSLC" "$sub" "${out[@]}" 199>&- 200>&-; then
+    rc=0
+  else
+    rc=$?
+  fi
+
+  # Detached run returns after successful startup; attached run returns when the
+  # container exits. Failure also returns here. In every case, terminate any
+  # monitor that has not already observed the running container.
+  stop_start_barrier_guard
+
+  return "$rc"
 }
 
 # handle_start <args...> : restore any wslc-remote shares referenced by the
@@ -1290,6 +1492,10 @@ container_is_running() {
   local running
 
   running="$(
+    # Only this monitor shell owns the lifecycle lock. Probe children must
+    # never inherit it or survive monitor cancellation while retaining it.
+    exec 199>&- 200>&-
+
     session_run docker inspect \
       --format '{{.State.Running}}' \
       "$container" 2>/dev/null |
@@ -1309,9 +1515,7 @@ handoff_start_barrier_until_running() {
   local container="$1"
 
   (
-    local i
-
-    for (( i=0; i<600; i++ )); do
+    while :; do
       if container_is_running "$container"; then
         exec 199>&-
         exit 0
@@ -1319,9 +1523,6 @@ handoff_start_barrier_until_running() {
 
       sleep 0.05
     done
-
-    exec 199>&-
-    exit 1
   ) &
 
   START_BARRIER_GUARD_PID=$!

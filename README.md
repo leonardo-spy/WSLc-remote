@@ -85,8 +85,9 @@ shares created by older versions are migrated in place when their running `unfsd
 be independently verified. Recovery also performs a bounded, force-synchronized probe of an
 existing NFS mount before reuse and verifies that its root fileid still matches the current source
 directory inode. An unhealthy mount is remounted only when no running container is using that
-volume. Container startup remains synchronized with mount repair until the runtime has consumed
-the validated backing mount; attached sessions do not retain that lifecycle lock afterward.
+volume. Existing-container start and run/create bind setup remain synchronized with mount repair
+until the runtime has consumed or committed the validated backing volumes; attached sessions do
+not retain that lifecycle lock afterward.
 
 `wslc volume remove` / `wslc volume prune` also tear down the matching NFS share. All other
 `volume` subcommands pass straight through.
