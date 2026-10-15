@@ -270,38 +270,108 @@ stop_share() {
 # userspace NFS server and/or the NFS mount backing that volume may no longer
 # exist.
 #
-# restore_share <volume>
-restore_share() {
+# write_share_state_atomic <statefile> <dir> <volume> <port> <pid> [ro]
+#
+# Write share metadata through a temporary file in the same directory and rename
+# it into place. rename(2) is atomic on the same filesystem, so another wslc
+# process sourcing the state file can only observe the old complete record or
+# the new complete record, never a partially-written one.
+write_share_state_atomic() {
+  local statef="$1" dir="$2" vol="$3" port="$4" pid="$5" ro="${6:-}"
+  local tmp_statef
+
+  tmp_statef="$(mktemp "${statef}.XXXXXX")" || return 1
+
+  if ! printf 'DIR=%s\nVOLUME=%s\nPORT=%s\nPID=%s\nRO=%s\n' \
+      "$dir" "$vol" "$port" "$pid" "$ro" >"$tmp_statef"; then
+    rm -f "$tmp_statef"
+    return 1
+  fi
+
+  if ! mv -f "$tmp_statef" "$statef"; then
+    rm -f "$tmp_statef"
+    return 1
+  fi
+}
+
+# acquire_share_lock <volume> -> sets SHARE_LOCK_FILE
+#
+# Serializes restoration of a single share across concurrent `wslc start`
+# processes. Creating a symlink is atomic, and its target stores the owning PID
+# so a later process can recover a stale lock left by a crashed process.
+acquire_share_lock() {
+  local vol="$1"
+  local lockf="$SHARES_DIR/$vol.restore.lock"
+  local owner
+  local i
+
+  for (( i=0; i<200; i++ )); do
+    if ln -s "$$" "$lockf" 2>/dev/null; then
+      SHARE_LOCK_FILE="$lockf"
+      return 0
+    fi
+
+    owner="$(readlink "$lockf" 2>/dev/null || true)"
+
+    if [[ "$owner" =~ ^[0-9]+$ ]] && ! kill -0 "$owner" 2>/dev/null; then
+      rm -f "$lockf" 2>/dev/null || true
+      continue
+    fi
+
+    sleep 0.05
+  done
+
+  warn "timed out waiting for restore lock for '$vol'"
+  return 1
+}
+
+release_share_lock() {
+  local lockf="$1"
+  local owner
+
+  owner="$(readlink "$lockf" 2>/dev/null || true)"
+
+  if [[ "$owner" == "$$" ]]; then
+    rm -f "$lockf" 2>/dev/null || true
+  fi
+}
+
+# restore_share_locked <volume>
+#
+# Caller must hold the per-volume restore lock.
+restore_share_locked() {
   local vol="$1"
   local statef="$SHARES_DIR/$vol.env"
+
+  # Keep sourced state local to this invocation. This prevents stale shell
+  # values from hiding a malformed state file.
+  local DIR="" VOLUME="" PORT="" PID="" RO=""
 
   [[ -f "$statef" ]] || return 0
 
   # shellcheck disable=SC1090
   source "$statef"
 
-  if [[ -z "${DIR:-}" || ! -d "$DIR" ]]; then
+  if [[ -z "$DIR" || ! -d "$DIR" ]]; then
     warn "cannot restore share '$vol': source directory no longer exists: ${DIR:-<unknown>}"
     return 1
   fi
 
-  if [[ -z "${PORT:-}" ]]; then
+  if [[ -z "$PORT" ]]; then
     warn "cannot restore share '$vol': no port recorded in $statef"
     return 1
   fi
 
   ensure_server
 
-  # If the original unfsd process disappeared, restart the same export on the
-  # same port. Existing NFS mounts already reference this endpoint and can
-  # recover once the server comes back.
+  # If the original unfsd disappeared, restart the same export on the same
+  # endpoint. Existing NFS mounts can then recover without container recreation.
   if ! {
-    [[ -n "${PID:-}" ]] &&
+    [[ -n "$PID" ]] &&
     kill -0 "$PID" 2>/dev/null &&
     port_is_up "$PORT"
   }; then
 
-    # Do not steal a port from an unrelated process.
     if port_is_up "$PORT"; then
       warn "cannot restore share '$vol': port $PORT is already in use"
       return 1
@@ -309,7 +379,7 @@ restore_share() {
 
     log "restoring NFS share: $DIR -> volume '$vol' (port $PORT)"
 
-    start_nfsd "$vol" "$DIR" "$PORT" "${RO:-}"
+    start_nfsd "$vol" "$DIR" "$PORT" "$RO"
 
     local pid="$NFSD_PID"
     local i
@@ -322,15 +392,24 @@ restore_share() {
 
     if ! kill -0 "$pid" 2>/dev/null || ! port_is_up "$PORT"; then
       kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
       warn "failed to restore NFS server for '$vol' on port $PORT"
       return 1
     fi
 
     PID="$pid"
+
+    # Persist the replacement PID before attempting to repair the runtime mount.
+    # If the mount fails later, the next retry sees the live replacement server.
+    if ! write_share_state_atomic \
+        "$statef" "$DIR" "$vol" "$PORT" "$PID" "$RO"; then
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      warn "failed to persist restored NFS server state for '$vol'"
+      return 1
+    fi
   fi
 
-  # The runtime VM may also have restarted. Ensure the guest volume exists and
-  # restore the NFS mount on its backing directory when necessary.
   "$WSLC" volume create --driver guest "$vol" \
     >/dev/null 2>&1 </dev/null || true
 
@@ -348,18 +427,30 @@ restore_share() {
     fi
   fi
 
-  # Refresh the persisted PID when unfsd had to be restarted.
-  cat > "$statef" <<EOF
-DIR=$DIR
-VOLUME=$vol
-PORT=$PORT
-PID=${PID:-}
-RO=${RO:-}
-EOF
-
   log "share ready: $DIR -> volume '$vol' (port $PORT)"
 }
 
+# restore_share <volume>
+restore_share() {
+  local vol="$1"
+  local lockf
+  local rc
+
+  if ! acquire_share_lock "$vol"; then
+    return 1
+  fi
+
+  lockf="$SHARE_LOCK_FILE"
+
+  if restore_share_locked "$vol"; then
+    rc=0
+  else
+    rc=$?
+  fi
+
+  release_share_lock "$lockf"
+  return "$rc"
+}
 # restore_container_shares <container>
 #
 # Inspect the existing container in the runtime VM and restore only volumes
@@ -517,7 +608,8 @@ handle_start() {
   exec "$WSLC" start "${args[@]}"
 }
 
-# ---------------------------------------------------------------------------# handle_volume <volume subcommand> <args...> : a drop-in for `wslc volume` that
+# ---------------------------------------------------------------------------
+# handle_volume <volume subcommand> <args...> : a drop-in for `wslc volume` that
 # is aware of wslc-remote's NFS-backed shares. `remove`/`rm` of a tracked share
 # tears the whole share down (server + mount + state), and `prune` reconciles any
 # shares whose backing volume it removed. Everything else passes straight through.
