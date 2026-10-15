@@ -1303,6 +1303,43 @@ mount_to_v() {
   fi
 }
 
+# Read /proc/<pid>/stat field 22 using shell builtins only. Guard processes
+# intentionally avoid spawning helpers that could inherit lifecycle FD 199.
+read_process_start_ticks_nofork() {
+  local pid="$1"
+  local stat_line
+  local rest
+  local -a fields=()
+
+  PROCESS_START_TICKS_NOFORK=""
+
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  [[ -r "/proc/$pid/stat" ]] || return 1
+
+  IFS= read -r stat_line <"/proc/$pid/stat" || return 1
+
+  [[ "$stat_line" == *") "* ]] || return 1
+
+  # Everything after the final ") " begins with field 3 (state).
+  rest="${stat_line##*) }"
+
+  read -r -a fields <<< "$rest"
+
+  # field 22 => offset 19 when field 3 is array index 0.
+  (( ${#fields[@]} >= 20 )) || return 1
+  [[ "${fields[19]}" =~ ^[0-9]+$ ]] || return 1
+
+  PROCESS_START_TICKS_NOFORK="${fields[19]}"
+}
+
+process_lifetime_matches_nofork() {
+  local pid="$1"
+  local expected_start="$2"
+
+  read_process_start_ticks_nofork "$pid" || return 1
+
+  [[ "$PROCESS_START_TICKS_NOFORK" == "$expected_start" ]]
+}
 runtime_running_container_ids() {
   local ids
 
@@ -1331,7 +1368,7 @@ container_uses_all_volumes() {
   )" || return 1
 
   for vol in "$@"; do
-    grep -Fxq "$vol" <<< "$mounts" || return 1
+    grep -Fxq "$vol" <<< "$mounts" 199>&- 200>&- || return 1
   done
 }
 
@@ -1340,17 +1377,34 @@ handoff_run_barrier_until_new_volume_user() {
   shift
 
   local -a volumes=("$@")
+  local owner_pid="$BASHPID"
+  local owner_start=""
+
+  if ! read_process_start_ticks_nofork "$owner_pid"; then
+    die "cannot record lifecycle guard owner identity"
+  fi
+
+  owner_start="$PROCESS_START_TICKS_NOFORK"
 
   (
+    trap - EXIT HUP INT TERM
+
     local ids
     local id
 
     while :; do
+      # Do not leave an orphaned lock holder if the owning wrapper lifetime
+      # disappears. Match start time as well as PID so PID reuse cannot make a
+      # dead owner appear alive.
+      if ! process_lifetime_matches_nofork "$owner_pid" "$owner_start"; then
+        exec 199>&-
+        exit 0
+      fi
       if ids="$(runtime_running_container_ids)"; then
         while IFS= read -r id; do
           [[ -n "$id" ]] || continue
 
-          if grep -Fxq "$id" <<< "$baseline"; then
+          if grep -Fxq "$id" <<< "$baseline" 199>&- 200>&-; then
             continue
           fi
 
@@ -1361,7 +1415,7 @@ handoff_run_barrier_until_new_volume_user() {
         done <<< "$ids"
       fi
 
-      sleep 0.05
+      sleep 0.05 199>&- 200>&-
     done
   ) &
 
@@ -1370,6 +1424,95 @@ handoff_run_barrier_until_new_volume_user() {
   # The monitor now owns the remaining locked open-file description.
   exec 199>&-
 }
+v_spec_has_host_dir() {
+  local spec="$1"
+  local src
+
+  [[ "$spec" == *:* ]] || return 1
+
+  src="${spec%%:*}"
+
+  is_host_path "$src" || return 1
+
+  [[ -d "$src" ]]
+}
+
+mount_spec_has_host_dir() {
+  local spec="$1"
+  local field
+  local key
+  local val
+  local src=""
+  local type=""
+  local -a fields=()
+
+  while IFS= read -r field; do
+    fields+=("$field")
+  done < <(printf '%s\n' "$spec" | tr ',' '\n')
+
+  for field in "${fields[@]}"; do
+    key="${field%%=*}"
+    val="${field#*=}"
+
+    case "$key" in
+      type)
+        type="$val"
+        ;;
+      source|src)
+        src="$val"
+        ;;
+    esac
+  done
+
+  [[ "$type" == bind || -z "$type" ]] || return 1
+  [[ -n "$src" ]] || return 1
+
+  is_host_path "$src" || return 1
+
+  [[ -d "$src" ]]
+}
+
+run_args_have_host_bind() {
+  local -a args=("$@")
+  local i
+  local a
+
+  for (( i=0; i<${#args[@]}; i++ )); do
+    a="${args[$i]}"
+
+    case "$a" in
+      -v|--volume)
+        if (( i + 1 < ${#args[@]} )); then
+          v_spec_has_host_dir "${args[$((i + 1))]}" &&
+            return 0
+
+          i=$((i + 1))
+        fi
+        ;;
+
+      -v=*|--volume=*)
+        v_spec_has_host_dir "${a#*=}" &&
+          return 0
+        ;;
+
+      --mount)
+        if (( i + 1 < ${#args[@]} )); then
+          mount_spec_has_host_dir "${args[$((i + 1))]}" &&
+            return 0
+
+          i=$((i + 1))
+        fi
+        ;;
+
+      --mount=*)
+        mount_spec_has_host_dir "${a#*=}" &&
+          return 0
+        ;;
+    esac
+  done
+
+  return 1
+}
 # run_wslc <run|create> <args...> : transparently NFS-ify host binds, then run wslc.
 run_wslc() {
   local sub="$1"
@@ -1377,16 +1520,24 @@ run_wslc() {
 
   [[ $# -ge 1 ]] || die "usage: wslc $sub <wslc $sub args...>"
 
-  ensure_state
-
+  local -a original_args=("$@")
   local -a out=()
   local -a startup_volumes=()
   local a
   local rc=0
   local baseline=""
 
-  # Bind rewriting, share creation/recovery and native startup form one
-  # lifecycle transaction. This also covers commands containing multiple binds.
+  # Commands without host-directory binds never interact with wslc-remote
+  # shares, so they must not wait behind the lifecycle barrier.
+  if ! run_args_have_host_bind "${original_args[@]}"; then
+    log "wslc $sub ${original_args[*]}"
+    exec "$WSLC" "$sub" "${original_args[@]}"
+  fi
+
+  ensure_state
+
+  # From the first host-backed bind through native startup, all rewritten
+  # volumes participate in one lifecycle transaction.
   if ! acquire_start_barrier; then
     die "failed to acquire lifecycle barrier before wslc $sub"
   fi
@@ -1465,6 +1616,10 @@ run_wslc() {
     die "failed to snapshot running containers before wslc run"
   fi
 
+  # Arm cleanup before transferring ownership of FD 199, eliminating the
+  # signal window between monitor creation and cleanup registration.
+  arm_start_barrier_guard_cleanup
+
   handoff_run_barrier_until_new_volume_user \
     "$baseline" "${startup_volumes[@]}"
 
@@ -1478,6 +1633,7 @@ run_wslc() {
   # container exits. Failure also returns here. In every case, terminate any
   # monitor that has not already observed the running container.
   stop_start_barrier_guard
+  disarm_start_barrier_guard_cleanup
 
   return "$rc"
 }
@@ -1513,15 +1669,29 @@ container_is_running() {
 # barrier as soon as the runtime reports the container running.
 handoff_start_barrier_until_running() {
   local container="$1"
+  local owner_pid="$BASHPID"
+  local owner_start=""
+
+  if ! read_process_start_ticks_nofork "$owner_pid"; then
+    die "cannot record lifecycle guard owner identity"
+  fi
+
+  owner_start="$PROCESS_START_TICKS_NOFORK"
 
   (
+    trap - EXIT HUP INT TERM
+
     while :; do
+      if ! process_lifetime_matches_nofork "$owner_pid" "$owner_start"; then
+        exec 199>&-
+        exit 0
+      fi
       if container_is_running "$container"; then
         exec 199>&-
         exit 0
       fi
 
-      sleep 0.05
+      sleep 0.05 199>&- 200>&-
     done
   ) &
 
@@ -1536,12 +1706,42 @@ stop_start_barrier_guard() {
 
   [[ -n "$pid" ]] || return 0
 
-  if kill -0 "$pid" 2>/dev/null; then
+  # Never signal a process based only on numeric PID existence. If the guard
+  # already exited and Bash reaped it, that PID may have been reused by an
+  # unrelated process. Only a currently-running child job of this shell is
+  # eligible for cancellation.
+  if jobs -pr | grep -Fxq "$pid"; then
     kill "$pid" 2>/dev/null || true
   fi
 
+  # wait is safe for the original child job and never signals a reused PID.
   wait "$pid" 2>/dev/null || true
+
   START_BARRIER_GUARD_PID=""
+}
+
+disarm_start_barrier_guard_cleanup() {
+  trap - EXIT HUP INT TERM
+}
+
+start_barrier_guard_signal_exit() {
+  local sig="$1"
+
+  stop_start_barrier_guard
+  disarm_start_barrier_guard_cleanup
+
+  # Preserve normal signal termination after cleanup.
+  kill -s "$sig" "$BASHPID"
+}
+
+arm_start_barrier_guard_cleanup() {
+  # A catchable wrapper termination must never bypass guard cleanup. Bash
+  # defers these traps while a foreground native command is executing, so the
+  # lifecycle barrier remains protected until that startup command returns.
+  trap 'stop_start_barrier_guard' EXIT
+  trap 'start_barrier_guard_signal_exit HUP' HUP
+  trap 'start_barrier_guard_signal_exit INT' INT
+  trap 'start_barrier_guard_signal_exit TERM' TERM
 }
 handle_start() {
   local -a args=("$@")
@@ -1590,6 +1790,10 @@ handle_start() {
     # Keep native attach in the foreground so WSLC retains its normal console
     # semantics. A short-lived guard inherits the exclusive lifecycle lock and
     # releases it only after Docker reports the container running.
+    # Register signal/exit cleanup before the guard receives the only remaining
+    # copy of the lifecycle lock.
+    arm_start_barrier_guard_cleanup
+
     handoff_start_barrier_until_running "$container"
 
     if "$WSLC" start "${args[@]}" 199>&- 200>&-; then
@@ -1601,6 +1805,7 @@ handle_start() {
     # If native startup failed or the container exited before the monitor
     # observed Running=true, ensure the guard cannot retain the barrier.
     stop_start_barrier_guard
+    disarm_start_barrier_guard_cleanup
 
     return "$start_rc"
   fi
