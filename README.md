@@ -82,8 +82,11 @@ or container runtime VM has stopped without recreating the container. Recovery v
 saved `unfsd` process identity and export configuration before reusing a live NFS endpoint; an
 occupied endpoint whose identity cannot be verified is rejected rather than mounted. Tracked
 shares created by older versions are migrated in place when their running `unfsd` instance can
-be independently verified. Recovery also probes an existing NFS mount before reuse; an unhealthy
-mount is remounted only when no running container is using that volume.
+be independently verified. Recovery also performs a bounded, force-synchronized probe of an
+existing NFS mount before reuse and verifies that its root fileid still matches the current source
+directory inode. An unhealthy mount is remounted only when no running container is using that
+volume. Container startup remains synchronized with mount repair until the runtime has consumed
+the validated backing mount; attached sessions do not retain that lifecycle lock afterward.
 
 `wslc volume remove` / `wslc volume prune` also tear down the matching NFS share. All other
 `volume` subcommands pass straight through.
