@@ -124,10 +124,10 @@ start_nfsd() {
   local ef="$STATE_DIR/$vol.exports" opts
   if [[ "$ro" == ro ]]; then opts="ro,insecure"; else opts="rw,no_root_squash,insecure"; fi
   printf '%s %s(%s)\n' "$dir" "$LOOPBACK" "$opts" >"$ef"
-  # FD 200 is reserved for the per-share restore flock. Close it in the
-  # background server so unfsd can never keep a restore lock alive.
+  # FDs 199/200 are reserved for lifecycle locking. Close them in the
+  # background server so unfsd can never keep a lifecycle lock alive.
   nohup "$UNFSD_BIN" -s -p -t -d -l "$LOOPBACK" -n "$port" -m "$port" -e "$ef" \
-      200>&- >"$STATE_DIR/$vol.log" 2>&1 &
+      199>&- 200>&- >"$STATE_DIR/$vol.log" 2>&1 &
   NFSD_PID=$!
 }
 
@@ -162,104 +162,274 @@ abort_share() {
 }
 
 # ---------------------------------------------------------------------------
-# share <hostdir> [ro] [name] -> sets SHARE_VOL to the wslc guest volume name.
-# `ro` (the string "ro" or empty) selects a read-only NFS export. Internal:
-# invoked while rewriting host binds during `run`/`create`. Runs in the
-# caller's (main) shell — NOT inside a command substitution — so that a die() in
-# the sharing path (missing unfsd, no free port, mount failure, ...) aborts
-# wslc-remote entirely instead of being swallowed by a subshell and silently
-# falling back to an un-accelerated plain `wslc` command.
-share() {
-  [[ $# -ge 1 ]] || die "internal error: share() needs a host directory"
-  ensure_state; ensure_server
-  local dir ro vol port statef
-  dir="$(cd "$1" 2>/dev/null && pwd)" || die "no such directory: $1"
-  ro="${2:-}"
-  vol="${3:-$(vol_name_for "$dir" "$ro")}"
-  statef="$SHARES_DIR/$vol.env"
+# acquire_share_lock <volume>
+#
+# Normal lifecycle operations take a shared global barrier plus an exclusive
+# per-volume lock. This allows unrelated shares to proceed concurrently while
+# letting global operations such as `volume prune` stop all lifecycle mutation
+# before modifying the runtime volume set.
+acquire_share_lock() {
+  local vol="$1"
+  local barrier="$SHARES_DIR/.lifecycle.lock"
+  local lockf="$SHARES_DIR/$vol.restore.lock"
 
-  # Idempotent: reuse a healthy existing share.
+  ensure_state
+
+  if ! command -v flock >/dev/null 2>&1; then
+    warn "cannot safely operate on share '$vol': 'flock' not found (install util-linux)"
+    return 1
+  fi
+
+  # FD 199: shared lifecycle barrier.
+  if ! exec 199>"$barrier"; then
+    warn "cannot open lifecycle barrier: $barrier"
+    return 1
+  fi
+
+  if ! flock -s -w 10 199; then
+    exec 199>&-
+    warn "timed out waiting for lifecycle barrier"
+    return 1
+  fi
+
+  # FD 200: exclusive lock for this volume.
+  if ! exec 200>"$lockf"; then
+    exec 199>&-
+    warn "cannot open lifecycle lock for '$vol': $lockf"
+    return 1
+  fi
+
+  if ! flock -w 10 200; then
+    exec 200>&-
+    exec 199>&-
+    warn "timed out waiting for lifecycle lock for '$vol'"
+    return 1
+  fi
+}
+
+release_share_lock() {
+  exec 200>&-
+  exec 199>&-
+}
+
+# acquire_prune_lock
+#
+# Global destructive operations take the lifecycle barrier exclusively. Once
+# acquired, no share creation, recovery, or explicit teardown can be in flight.
+acquire_prune_lock() {
+  local barrier="$SHARES_DIR/.lifecycle.lock"
+
+  ensure_state
+
+  if ! command -v flock >/dev/null 2>&1; then
+    warn "cannot safely prune shares: 'flock' not found (install util-linux)"
+    return 1
+  fi
+
+  if ! exec 199>"$barrier"; then
+    warn "cannot open lifecycle barrier: $barrier"
+    return 1
+  fi
+
+  if ! flock -w 30 199; then
+    exec 199>&-
+    warn "timed out waiting for lifecycle operations before volume prune"
+    return 1
+  fi
+}
+
+release_prune_lock() {
+  exec 199>&-
+}
+# share_locked <hostdir> [ro] <volume>
+#
+# Caller must hold the per-volume lifecycle lock.
+share_locked() {
+  local dir="$1"
+  local ro="${2:-}"
+  local vol="$3"
+  local statef="$SHARES_DIR/$vol.env"
+  local port
+  local pid
+  local i
+
+  # An existing tracked share must be recovered in place. Never tear it down
+  # implicitly: existing containers may still reference this exact volume.
   if [[ -f "$statef" ]]; then
-    # shellcheck disable=SC1090
-    source "$statef"
-    if kill -0 "${PID:-0}" 2>/dev/null && port_is_up "$PORT" && vol_mounted "$vol"; then
-      log "reusing share: $dir -> volume '$vol' (port $PORT)"
-      SHARE_VOL="$vol"; return 0
+    if restore_share_locked "$vol"; then
+      log "reusing share: $dir -> volume '$vol'"
+      SHARE_VOL="$vol"
+      return 0
     fi
-    stop_share "$vol" >/dev/null 2>&1 || true
+
+    die "existing share '$vol' could not be recovered safely; refusing destructive teardown while containers may still reference it. Remove the volume explicitly if teardown is intended."
   fi
 
   port="$(alloc_port)"
-  log "serving $dir over NFS on $LOOPBACK:$port${ro:+ (read-only)}"
-  start_nfsd "$vol" "$dir" "$port" "$ro"
-  local pid=$NFSD_PID
 
-  # Wait for OUR server to accept connections. Bail out the moment it dies (e.g.
-  # it couldn't bind the port): otherwise a *different* server already listening
-  # on $port would satisfy port_is_up and we'd mount against the wrong export.
-  local i
+  log "serving $dir over NFS on $LOOPBACK:$port${ro:+ (read-only)}"
+
+  start_nfsd "$vol" "$dir" "$port" "$ro"
+  pid="$NFSD_PID"
+
+  # Wait for OUR server to accept connections. Bail out the moment it dies;
+  # another server listening on this port must not satisfy the health check.
   for (( i=0; i<50; i++ )); do
     kill -0 "$pid" 2>/dev/null || break
     port_is_up "$port" && break
     sleep 0.1
   done
+
   if ! kill -0 "$pid" 2>/dev/null; then
     abort_share "$vol" "$pid"
     die "NFS server (unfsd) exited at startup — port $port may be held by a stale server. See $STATE_DIR/$vol.log"
   fi
+
   if ! port_is_up "$port"; then
     abort_share "$vol" "$pid"
     die "NFS server did not come up on $LOOPBACK:$port (see $STATE_DIR/$vol.log)"
   fi
 
   log "creating wslc guest volume '$vol' and NFS-mounting its backing store"
-  "$WSLC" volume create --driver guest "$vol" >/dev/null 2>&1 </dev/null || true
+
+  "$WSLC" volume create --driver guest "$vol" \
+    >/dev/null 2>&1 </dev/null || true
+
   if ! session_run sh -c "
     T=/var/lib/docker/volumes/$vol/_data
     mkdir -p \"\$T\"
-    grep -q \" \$T nfs \" /proc/mounts || mount -i -t nfs -o $(nfs_opts "$port") :$dir \"\$T\"
+    grep -q \" \$T nfs \" /proc/mounts ||
+      mount -i -t nfs -o $(nfs_opts "$port") :$dir \"\$T\"
   "; then
     abort_share "$vol" "$pid"
     die "failed to NFS-mount volume backing store (see $STATE_DIR/$vol.log)"
   fi
 
-  cat > "$statef" <<EOF
-DIR=$dir
-VOLUME=$vol
-PORT=$port
-PID=$pid
-RO=$ro
-EOF
+  # Use the same atomic state writer as recovery so other processes never see
+  # a partially-created record.
+  if ! write_share_state_atomic \
+      "$statef" "$dir" "$vol" "$port" "$pid" "$ro"; then
+    abort_share "$vol" "$pid"
+    die "failed to persist share state for '$vol'"
+  fi
+
   log "share ready: $dir -> volume '$vol'"
   SHARE_VOL="$vol"
 }
 
-# ---------------------------------------------------------------------------
-stop_share() {
-  local vol="$1" statef="$SHARES_DIR/$1.env"
-  [[ -f "$statef" ]] || { warn "no such share: $vol"; return 1; }
+# share <hostdir> [ro] [name] -> sets SHARE_VOL to the wslc guest volume name.
+#
+# `ro` selects a read-only NFS export. Creation/reuse is serialized with
+# recovery and teardown using the same per-volume lifecycle lock.
+share() {
+  [[ $# -ge 1 ]] || die "internal error: share() needs a host directory"
+
+  ensure_state
+  ensure_server
+
+  local dir
+  local ro
+  local vol
+  local rc
+
+  dir="$(cd "$1" 2>/dev/null && pwd)" || die "no such directory: $1"
+  ro="${2:-}"
+  vol="${3:-$(vol_name_for "$dir" "$ro")}"
+
+  if ! acquire_share_lock "$vol"; then
+    die "failed to acquire lifecycle lock for share '$vol'"
+  fi
+
+  if share_locked "$dir" "$ro" "$vol"; then
+    rc=0
+  else
+    rc=$?
+  fi
+
+  release_share_lock
+
+  return "$rc"
+}
+
+# stop_share_locked <volume>
+#
+# Destructive teardown is allowed only on this explicit path. Caller must hold
+# the same lifecycle lock used by creation and recovery.
+stop_share_locked() {
+  local vol="$1"
+  local statef="$SHARES_DIR/$vol.env"
+
+  local DIR="" VOLUME="" PORT="" PID="" RO=""
+
+  [[ -f "$statef" ]] || {
+    warn "no such share: $vol"
+    return 1
+  }
+
   # shellcheck disable=SC1090
   source "$statef"
-  # Guest volumes are docker local volumes in the runtime dockerd; remove any
-  # container still holding it (else volume removal fails), then unmount + remove.
+
+  # Guest volumes are docker local volumes in the runtime dockerd. Explicit
+  # teardown removes containers still holding the volume before volume removal.
   local cids
-  cids="$(session_run docker ps -aq --filter "volume=$vol" 2>/dev/null | tr -d '\r')"
+
+  cids="$(
+    session_run docker ps -aq --filter "volume=$vol" 2>/dev/null |
+      tr -d '\r'
+  )"
+
   if [[ -n "$cids" ]]; then
     log "removing containers using '$vol'"
+
     # shellcheck disable=SC2086
     session_run docker rm -f $cids >/dev/null 2>&1 || true
   fi
+
   log "unmounting + removing volume '$vol'"
-  session_run sh -c "umount -f /var/lib/docker/volumes/$vol/_data 2>/dev/null || true" || true
+
+  session_run sh -c \
+    "umount -f /var/lib/docker/volumes/$vol/_data 2>/dev/null || true" \
+    || true
+
   "$WSLC" volume remove "$vol" >/dev/null 2>&1 </dev/null \
     || session_run docker volume rm "$vol" >/dev/null 2>&1 \
     || warn "could not remove volume '$vol' (a container may still use it)"
-  if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2>/dev/null; then
-    log "stopping NFS server (pid $PID)"; kill "$PID" 2>/dev/null || true
+
+  if [[ -n "$PID" ]] && kill -0 "$PID" 2>/dev/null; then
+    log "stopping NFS server (pid $PID)"
+    kill "$PID" 2>/dev/null || true
   fi
-  rm -f "$statef" "$STATE_DIR/$vol.log" "$STATE_DIR/$vol.exports"
+
+  rm -f \
+    "$statef" \
+    "$STATE_DIR/$vol.log" \
+    "$STATE_DIR/$vol.exports"
 }
 
+# stop_share <volume>
+#
+# Explicit teardown participates in the same lifecycle lock as creation and
+# recovery, so it cannot mutate the volume while either operation is in flight.
+stop_share() {
+  local vol="$1"
+  local rc
+
+  ensure_state
+
+  if ! acquire_share_lock "$vol"; then
+    return 1
+  fi
+
+  if stop_share_locked "$vol"; then
+    rc=0
+  else
+    rc=$?
+  fi
+
+  release_share_lock
+
+  return "$rc"
+}
 # ---------------------------------------------------------------------------
 # Restore existing wslc-remote shares used by stopped containers.
 #
@@ -392,31 +562,13 @@ restore_share_locked() {
 
 # restore_share <volume>
 #
-# Serialize restoration of a share with a kernel-managed flock. The lock file
-# itself may remain on disk indefinitely; ownership exists only while a process
-# holds the kernel lock, so process termination cannot leave a stale lock behind.
-#
-# File descriptor 200 is reserved for this lock. start_nfsd() explicitly closes
-# it in the background server so unfsd cannot accidentally retain the lock after
-# this shell finishes restoration.
+# Recovery uses the same per-volume lifecycle lock as share creation/reuse and
+# explicit teardown.
 restore_share() {
   local vol="$1"
-  local lockf="$SHARES_DIR/$vol.restore.lock"
   local rc
 
-  if ! command -v flock >/dev/null 2>&1; then
-    warn "cannot safely restore share '$vol': 'flock' not found (install util-linux)"
-    return 1
-  fi
-
-  if ! exec 200>"$lockf"; then
-    warn "cannot open restore lock for '$vol': $lockf"
-    return 1
-  fi
-
-  if ! flock -w 10 200; then
-    exec 200>&-
-    warn "timed out waiting for restore lock for '$vol'"
+  if ! acquire_share_lock "$vol"; then
     return 1
   fi
 
@@ -426,9 +578,7 @@ restore_share() {
     rc=$?
   fi
 
-  # Closing the descriptor releases the kernel lock. Do not unlink the lock
-  # file: keeping a stable inode avoids races between concurrent openers.
-  exec 200>&-
+  release_share_lock
 
   return "$rc"
 }
@@ -659,10 +809,24 @@ handle_volume() {
       [[ $names -gt 0 ]] && { "$WSLC" volume remove "${passthrough[@]}" || rc=1; }
       exit $rc ;;
     prune)
-      shift; ensure_state
-      "$WSLC" volume prune "$@" || true
-      reconcile_shares
-      exit 0 ;;
+      shift
+      ensure_state
+
+      if ! acquire_prune_lock; then
+        die "failed to acquire lifecycle barrier for volume prune"
+      fi
+
+      local prune_rc=0
+
+      "$WSLC" volume prune "$@" || prune_rc=$?
+
+      if ! reconcile_shares; then
+        prune_rc=1
+      fi
+
+      release_prune_lock
+      exit "$prune_rc"
+      ;;
     *) exec "$WSLC" volume "$@" ;;
   esac
 }
@@ -671,19 +835,49 @@ handle_volume() {
 # bare `wslc volume remove`/`prune`): stop its server and delete its state.
 reconcile_shares() {
   ensure_state
-  local f vol
+
+  local f
+  local vol
+  local volumes
+
+  # Called while handle_volume owns the exclusive lifecycle barrier. Query the
+  # runtime's actual volume set instead of using mount state: an existing share
+  # may legitimately be temporarily unmounted and recoverable.
+  if ! volumes="$(
+    session_run docker volume ls --format '{{.Name}}' 2>/dev/null |
+      tr -d '\r'
+  )"; then
+    warn "cannot reconcile shares: failed to list runtime volumes"
+    return 1
+  fi
+
   for f in "$SHARES_DIR"/*.env; do
     [[ -e "$f" ]] || continue
+
     vol="$(basename "$f" .env)"
-    if ! vol_mounted "$vol"; then
-      log "share '$vol' backing volume gone; stopping server + cleaning state"
-      # shellcheck disable=SC1090
-      ( source "$f"; [[ -n "${PID:-}" ]] && kill "$PID" 2>/dev/null || true )
-      rm -f "$f" "$STATE_DIR/$vol.log" "$STATE_DIR/$vol.exports"
+
+    if grep -Fxq "$vol" <<< "$volumes"; then
+      continue
     fi
+
+    log "share '$vol' backing volume gone; stopping server + cleaning state"
+
+    # shellcheck disable=SC1090
+    (
+      local DIR="" VOLUME="" PORT="" PID="" RO=""
+      source "$f"
+
+      if [[ -n "$PID" ]]; then
+        kill "$PID" 2>/dev/null || true
+      fi
+    )
+
+    rm -f \
+      "$f" \
+      "$STATE_DIR/$vol.log" \
+      "$STATE_DIR/$vol.exports"
   done
 }
-
 # ---------------------------------------------------------------------------
 # check_deps : verify required userspace tools plus the wslc pieces
 # wslc-remote relies on, ending with a real loopback reachability probe between
