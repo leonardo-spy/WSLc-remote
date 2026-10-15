@@ -124,8 +124,10 @@ start_nfsd() {
   local ef="$STATE_DIR/$vol.exports" opts
   if [[ "$ro" == ro ]]; then opts="ro,insecure"; else opts="rw,no_root_squash,insecure"; fi
   printf '%s %s(%s)\n' "$dir" "$LOOPBACK" "$opts" >"$ef"
+  # FD 200 is reserved for the per-share restore flock. Close it in the
+  # background server so unfsd can never keep a restore lock alive.
   nohup "$UNFSD_BIN" -s -p -t -d -l "$LOOPBACK" -n "$port" -m "$port" -e "$ef" \
-      >"$STATE_DIR/$vol.log" 2>&1 &
+      200>&- >"$STATE_DIR/$vol.log" 2>&1 &
   NFSD_PID=$!
 }
 
@@ -294,48 +296,6 @@ write_share_state_atomic() {
   fi
 }
 
-# acquire_share_lock <volume> -> sets SHARE_LOCK_FILE
-#
-# Serializes restoration of a single share across concurrent `wslc start`
-# processes. Creating a symlink is atomic, and its target stores the owning PID
-# so a later process can recover a stale lock left by a crashed process.
-acquire_share_lock() {
-  local vol="$1"
-  local lockf="$SHARES_DIR/$vol.restore.lock"
-  local owner
-  local i
-
-  for (( i=0; i<200; i++ )); do
-    if ln -s "$$" "$lockf" 2>/dev/null; then
-      SHARE_LOCK_FILE="$lockf"
-      return 0
-    fi
-
-    owner="$(readlink "$lockf" 2>/dev/null || true)"
-
-    if [[ "$owner" =~ ^[0-9]+$ ]] && ! kill -0 "$owner" 2>/dev/null; then
-      rm -f "$lockf" 2>/dev/null || true
-      continue
-    fi
-
-    sleep 0.05
-  done
-
-  warn "timed out waiting for restore lock for '$vol'"
-  return 1
-}
-
-release_share_lock() {
-  local lockf="$1"
-  local owner
-
-  owner="$(readlink "$lockf" 2>/dev/null || true)"
-
-  if [[ "$owner" == "$$" ]]; then
-    rm -f "$lockf" 2>/dev/null || true
-  fi
-}
-
 # restore_share_locked <volume>
 #
 # Caller must hold the per-volume restore lock.
@@ -431,16 +391,34 @@ restore_share_locked() {
 }
 
 # restore_share <volume>
+#
+# Serialize restoration of a share with a kernel-managed flock. The lock file
+# itself may remain on disk indefinitely; ownership exists only while a process
+# holds the kernel lock, so process termination cannot leave a stale lock behind.
+#
+# File descriptor 200 is reserved for this lock. start_nfsd() explicitly closes
+# it in the background server so unfsd cannot accidentally retain the lock after
+# this shell finishes restoration.
 restore_share() {
   local vol="$1"
-  local lockf
+  local lockf="$SHARES_DIR/$vol.restore.lock"
   local rc
 
-  if ! acquire_share_lock "$vol"; then
+  if ! command -v flock >/dev/null 2>&1; then
+    warn "cannot safely restore share '$vol': 'flock' not found (install util-linux)"
     return 1
   fi
 
-  lockf="$SHARE_LOCK_FILE"
+  if ! exec 200>"$lockf"; then
+    warn "cannot open restore lock for '$vol': $lockf"
+    return 1
+  fi
+
+  if ! flock -w 10 200; then
+    exec 200>&-
+    warn "timed out waiting for restore lock for '$vol'"
+    return 1
+  fi
 
   if restore_share_locked "$vol"; then
     rc=0
@@ -448,7 +426,10 @@ restore_share() {
     rc=$?
   fi
 
-  release_share_lock "$lockf"
+  # Closing the descriptor releases the kernel lock. Do not unlink the lock
+  # file: keeping a stable inode avoids races between concurrent openers.
+  exec 200>&-
+
   return "$rc"
 }
 # restore_container_shares <container>
@@ -658,7 +639,7 @@ reconcile_shares() {
 }
 
 # ---------------------------------------------------------------------------
-# check_deps : verify the one extra dependency (unfsd) plus the wslc pieces
+# check_deps : verify required userspace tools plus the wslc pieces
 # wslc-remote relies on, ending with a real loopback reachability probe between
 # the runtime VM and this distro. No installs and no networking-mode assumptions.
 check_deps() {
@@ -672,6 +653,12 @@ check_deps() {
     _pass "userspace NFS server: $(command -v "$UNFSD_BIN")"
   else
     _fail "unfsd (UNFS3) not on PATH — install from https://github.com/unfs3/unfs3 or set WSLC_REMOTE_UNFSD"
+  fi
+
+  if command -v flock >/dev/null 2>&1; then
+    _pass "share locking: $(command -v flock)"
+  else
+    _fail "flock not found — install util-linux"
   fi
 
   if "$WSLC" version >/dev/null 2>&1; then _pass "wslc CLI: $WSLC"; else _fail "wslc CLI not found (set \$WSLC or install WSL container support)"; fi

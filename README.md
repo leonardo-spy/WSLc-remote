@@ -30,6 +30,8 @@ bash install.sh
   Run `wslc _check` to test the actual connection instead of relying on the configured
   mode name. After changing `%USERPROFILE%\.wslconfig`, run `wsl --shutdown`.
 - bash 4+
+- **`flock`** from `util-linux` — normally installed by default on supported WSL
+  distros; used to serialize concurrent recovery of the same remote share.
 - **`unfsd`** — the [UNFS3](https://github.com/unfs3/unfs3) userspace NFSv3 server. This is the
   only extra dependency. The installer gets it from the distro package where available, or
   builds the official release automatically on Debian/Ubuntu:
